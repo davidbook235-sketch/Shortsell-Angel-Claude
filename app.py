@@ -45,13 +45,54 @@ def fo_universe():
         return set()
 
 
-@st.cache_data(ttl=43200, show_spinner="Angel One instrument list load ho rahi hai...")
+SCRIP_URLS = ["https://margincalculator.angelbroking.com/OpenAPI_Files/files/OpenAPIScripMaster.json",
+               "https://margincalculator.angelone.in/OpenAPI_Files/files/OpenAPIScripMaster.json"]
+TOK = st.cache_resource(lambda: {})()
+
+
+@st.cache_data(ttl=43200, show_spinner="Angel One instrument list load ho rahi hai (30-60 sec)...")
 def scrip_map():
     """NSE equity symbol -> Angel One token."""
-    url = "https://margincalculator.angelbroking.com/OpenAPI_Files/files/OpenAPIScripMaster.json"
-    rows = requests.get(url, headers=UA, timeout=90).json()
-    return {r["symbol"][:-3]: r["token"] for r in rows
-            if r.get("exch_seg") == "NSE" and r.get("symbol", "").endswith("-EQ")}
+    last = None
+    for url in SCRIP_URLS:
+        for _ in range(2):
+            try:
+                r = requests.get(url, headers=UA, timeout=(15, 180))
+                r.raise_for_status()
+                rows = r.json()
+                m = {x["symbol"][:-3]: x["token"] for x in rows
+                     if x.get("exch_seg") == "NSE" and x.get("symbol", "").endswith("-EQ")}
+                del rows
+                if m:
+                    return m
+            except Exception as e:
+                last = e
+    raise RuntimeError(f"{type(last).__name__}: {last}")
+
+
+def find_tokens(api, syms):
+    """Slow fallback: Angel searchScrip se token dhundho (cache hota hai)."""
+    for s in syms:
+        if s in TOK:
+            continue
+        wait("s", 0.6)
+        try:
+            for x in (api.searchScrip("NSE", s + "-EQ").get("data") or []):
+                if x.get("tradingsymbol") == s + "-EQ":
+                    TOK[s] = str(x["symboltoken"])
+                    break
+        except Exception:
+            pass
+    return {s: TOK[s] for s in syms if s in TOK}
+
+
+def get_tmap(api, syms):
+    try:
+        return scrip_map()
+    except Exception as e:
+        st.warning(f"Instrument list load nahi hui ({e}). Slow fallback chal raha hai, pehli baar ~2 min lag sakte hain.")
+        with st.spinner("Tokens dhundh raha hoon..."):
+            return find_tokens(api, syms)
 
 
 def secret(k):
@@ -281,11 +322,7 @@ with tab1:
         if fo_only and not fo:
             st.warning("F&O list load nahi hui, filter skip kiya.")
         pool = [s for s in syms_all if s in fo] if (fo_only and fo) else syms_all
-        try:
-            tmap = scrip_map()
-        except Exception:
-            tmap = {}
-            st.error("Angel One instrument list load nahi hui.")
+        tmap = get_tmap(api, pool[:n])
         pool_t = [(s, tmap[s]) for s in pool[:n] if s in tmap]
         with st.spinner("Live quotes aa rahe hain..."):
             quotes = get_quotes(api, tuple(t for _, t in pool_t))
@@ -300,7 +337,7 @@ with tab1:
             if ltp > 0 and pc > 0:
                 qrows.append((s, t, (ltp / pc - 1) * 100, ltp, avg, vol * ltp / 1e7))
         if not qrows:
-            st.error("Quotes nahi aaye. Login/session check karo (Angel session raat tak chalta hai) aur dobara try karo.")
+            st.error("Quotes/tokens nahi mile. Upar ka warning dekho, login/session check karo aur dobara try karo.")
         else:
             cand = [r for r in qrows if r[3] >= minp and r[5] >= minv and (not neg_only or r[2] < 0)
                     and (not pre_vwap or r[4] <= 0 or r[3] < r[4])]
@@ -391,7 +428,7 @@ with tab2:
         bt_clicked = True
         fo = fo_universe()
         pool = ([s for s in syms_all if s in fo] + [s for s in syms_all if s not in fo])[:bn]
-        tm = scrip_map() if api else {}
+        tm = get_tmap(api, pool) if api else {}
         pool = [(s, tm[s]) for s in pool if s in tm]
         fr = []
         if not api:
@@ -416,20 +453,4 @@ with tab2:
             gp, gl = T.Ret[T.Ret > 0].sum(), -T.Ret[T.Ret < 0].sum()
             m = st.columns(2)
             m[0].metric("Trades", len(T))
-            m[1].metric("Win rate", f"{(T.Ret > 0).mean() * 100:.1f}%")
-            m = st.columns(2)
-            m[0].metric("Profit factor", f"{gp / gl:.2f}" if gl else "∞")
-            m[1].metric("Avg trade", f"{T.Ret.mean() * 100:.2f}%")
-            m = st.columns(2)
-            m[0].metric("Total return", f"{(eq.iloc[-1] - 1) * 100:.1f}%")
-            m[1].metric("Max drawdown", f"{(eq / eq.cummax() - 1).min() * 100:.1f}%")
-            st.line_chart(pd.Series(eq.values, index=range(len(eq)), name="Equity"))
-            st.dataframe(T, hide_index=True, use_container_width=True)
-            st.download_button("⬇️ Trades CSV", T.to_csv(index=False), "intraday_trades.csv")
-    st.caption("Rule: 9:30–2:30 ke beech pehli candle jo VWAP, Opening Range low aur EMA20 teeno ke neeche close kare → "
-               "agli candle open par short. Stop pehle check hota hai, 3:15 PM par squareoff. Roz 1 trade/stock. "
-               "Angel history: 5m me max 100 din. Result indicative hai, real slippage alag hota hai.")
-
-if auto and st.session_state.get("run") and not bt_clicked:
-    time.sleep(secs)
-    st.rerun()
+            m[1].metric("Win rate", f"{(T.Ret > 0).mean() 
